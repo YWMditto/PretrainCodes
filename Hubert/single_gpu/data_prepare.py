@@ -3,6 +3,8 @@ import logging
 from typing import Union, List, Any, Optional, Callable
 from pathlib import Path
 import soundfile as sf
+import numpy as np
+from itertools import chain
 
 import torch
 from torch.utils.data import Dataset, Sampler, BatchSampler
@@ -10,7 +12,6 @@ import torch.nn.functional as F
 
 
 logger = logging.getLogger(__name__)
-
 
 
 def load_audio(manifest_path, max_keep_sample_size, min_keep_sample_size):
@@ -190,24 +191,273 @@ fairseq 中对于数据的实际拿取的过程：
 
     1. filter by size，如果设置，则对数据集再次进行筛选；
     2. order indices 或者 bucket order indices，对数据按照长度进行排序或者分成几个 ``桶``，每个桶中按照长度进行排序；
-    3. collate：
-        a. constant token batch，一个 batch 中数据长度尽可能一样，并且按照加起来的总长度决定一个 batch 的大小；
-        b. pad or crop，按照设置进行 pad 或者 crop，注意同时需要对 label 进行 pad 和 crop；
+    3. constant token batch，一个 batch 中数据长度尽可能一样，并且按照加起来的总长度决定一个 batch 的大小；
+    4. collate: pad or crop，按照设置进行 pad 或者 crop，注意同时需要对 label 进行 pad 和 crop；
 
 注意这里的操作的顺序是和 fairseq 中的顺序保持一致的；
+此外 fairseq 的数据流程，重写各种 iterator 以及具体的数据拿取过程（例如预取），可能进行了大量的优化，这里因为我们主要是想评测一下 deepspeed
+对于模型训练的优化，因此按照最简单的 pytorch 的基本写法来编写；
 """
-
 
 
 class HubertBatchSampler:
     """
     这里将原本就属于 batch sampler 的操作从 dataset 中移到该类中；
 
+    该类主要负责：
+        1. filter by size，如果设置，则对数据集再次进行筛选；
+        2. order indices 或者 bucket order indices，对数据按照长度进行排序或者分成几个 ``桶``，每个桶中按照长度进行排序；
+        3. constant token batch，一个 batch 中数据长度尽可能一样，并且按照加起来的总长度决定一个 batch 的大小；
+            这一步整体的思想就是先按照长度排序，然后分桶；
+            如果随机，那么需要 a. 打乱桶之间的顺序；b. 打乱桶内数据的顺序；（如果不随机，那么实际上分桶也没有意义；）
+            然后每次 iter 时，将所有桶的数据连在一起，然后按照一个 batch 的 token 数量打包成一个个 batch；
 
-    *** 该 batch sampler 在 multi gpu 中需要进行重写；
+    *** 该 batch sampler 在 multi gpu 中需要进行重写，不过并不复杂，主要的操作在于按照进程数量对数据集进行切片；
+
+    该类用于替换 pytorch dataloader 中原本的 BatchSampler，对于一个 batch sampler 来说，需要考虑以下问题：
+        1. 该类是一个可迭代对象，需要实现 __iter__ 方法；
+        2. 需要考虑在遍历过程中再次调用 iter 方法是否需要重置该类的内部状态，然后返回一个全新的循环；（通常来讲每次调用 iter 都返回一个全新的循环；）
+        3. 需要考虑每次 iter 时是否再对数据的遍历顺序进行随机地打乱；
     """
+    def __init__(
+        self,
+        size_list: List[int],
+        one_batch_total_tokens: int,
+        filter_size: Optional[int] = None,
+        num_buckets: Optional[int] = None,
+        shuffle: bool = False,
+        seed: int = 0,
+        dataset_name: str = 'tmp',
+        **kwargs
+    ):
+        logger.info(f"Use ``HubertBatchSampler``, current dataset is {dataset_name}.")
 
-    
+        self.size_list = size_list
+        self.one_batch_total_tokens = one_batch_total_tokens
+        self.filter_size = filter_size
+        self.num_buckets = num_buckets
+        self.shuffle = shuffle
+        self._seed = seed
+        self.dataset_name = dataset_name
+        self.epoch = kwargs.get('epoch', 0)
+
+        self.size_list_with_indices = [(idx, w) for idx, w in enumerate(size_list)]
+        self.size_list_with_indices = sorted(self.size_list_with_indices, key=lambda x: x[1])
+
+        if filter_size is not None:
+            filter_size = min(filter_size, one_batch_total_tokens)
+        else:
+            filter_size = one_batch_total_tokens
+
+        self.size_list_with_indices, longer_num = self.filter_by_size(self.size_list_with_indices, filter_size, has_sorted=True)
+        logger.warning(f"Dataset {dataset_name} has {longer_num} samples whose lengths are longer than "
+                       f"one_batch_total_tokens: {one_batch_total_tokens} or filter_size: {filter_size}.")
+
+        # 提前分桶；
+        if self.shuffle and num_buckets is not None and num_buckets > 1:
+            each_bucket_num = len(self.size_list_with_indices) // num_buckets
+            indices_buckets = []
+            for i in range(num_buckets):
+                indices_buckets.append(self.size_list_with_indices[i*each_bucket_num: (i+1)*each_bucket_num])
+            indices_buckets[-1].extend(self.size_list_with_indices[(i+1)*each_bucket_num: ])
+        else:
+            indices_buckets = [self.size_list_with_indices]
+        self.indices_buckets = indices_buckets
+        self.batches = self.batchify()
+
+    @staticmethod
+    def filter_by_size(size_list_with_indices, filter_size, has_sorted=False):
+        tmp_list = []
+        longer_num = 0
+        if not has_sorted:
+            for sample in size_list_with_indices:
+                if sample[1] <= filter_size:
+                    tmp_list.append(sample)
+                else:
+                    longer_num += 1
+        else:
+            for ii in range(len(size_list_with_indices)-1, -1, -1):
+                if size_list_with_indices[ii][1] <= filter_size:
+                    break
+                else:
+                    longer_num += 1
+            tmp_list = size_list_with_indices[:ii+1]
+        return tmp_list, longer_num
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    @property
+    def seed(self) -> int:
+        return abs(self._seed + self.epoch)
+
+    def batchify(self):
+        if self.shuffle:
+            rng = np.random.default_rng(seed=self.seed)
+            rng.shuffle(self.indices_buckets)
+            for bucket in self.indices_buckets:
+                rng.shuffle(bucket)
+
+        batches = []
+        cur_batch_max_length = -1
+        cur_idx = 0
+        cur_batch = []
+        indices = list(chain(*self.indices_buckets))
+
+        while cur_idx < len(indices):
+            sample_idx, sample_length = indices[cur_idx]
+            max_length = max(cur_batch_max_length, sample_length)
+            if max_length * (len(cur_batch) + 1) <= self.one_batch_total_tokens:
+                cur_batch.append(sample_idx)
+            else:
+                batches.append(cur_batch)
+                cur_batch = [sample_idx]
+            cur_batch_max_length = max_length
+            cur_idx += 1
+        batches.append(cur_batch)
+
+        if self.shuffle:
+            rng = np.random.default_rng(self.seed)
+            rng.shuffle(batches)
+
+        # 将 token 数量最多的 batch、单个数据长度最长的 batch 以及 batch size 最大的 batch 放在最前面，从而提前发现 OOM；
+        max_tokens_batch_idx = np.argmax([sum(self.size_list[w] for w in _batch) for _batch in batches])
+        max_length_batch_idx = np.argmax([max(self.size_list[w] for w in _batch) for _batch in batches])
+        max_size_batch_idx = np.argmax(map(len, batches))
+        for idx in {max_tokens_batch_idx, max_length_batch_idx, max_size_batch_idx}:
+            batch = batches.pop(idx)
+            batches.insert(0, batch)
+
+        logger.info(f"Dataset {self.dataset_name} uses total {len(indices)} samples and is packed into {len(batches)} batches.")
+        return batches
+
+    def __iter__(self):
+        for batch in self.batches:
+            yield batch
+
+        if self.shuffle:
+            self.batches = self.batchify()
+
+    def __len__(self):
+        return len(self.batches)
+
+
+class HubertCollater:
+    def __init__(
+        self,
+        max_sample_size: int,
+        pad_audio: bool,
+        random_crop: bool,
+        pad_token_id: int,
+        sample_rate: int = 16000,
+        label_rate: int = 50
+    ):
+        self.max_sample_size = max_sample_size
+        self.pad_audio = pad_audio
+        self.random_crop = random_crop
+        self.pad_token_id = pad_token_id
+        self.sample_rate = sample_rate
+        self.label_rate = sample_rate
+
+        logger.info(f"HubertCollater is configured as: \n"
+                    f"\tmax_sample_size: {max_sample_size},"
+                    f"\tpad_audio: {pad_audio},"
+                    f"\trandom_crop: {random_crop},"
+                    f"\tpad_token_id: {pad_token_id},"
+                    f"\tsample_rate: {sample_rate},"
+                    f"\tlabel_rate: {label_rate}.")
+
+        self.s2f = label_rate / sample_rate
+
+    def collate_fn(self, batch):
+        """
+        hubert 的预训练默认是将一个 batch 中的所有音频全部随机裁剪到最短长度；
+
+        :param batch:
+        :param max_sample_size: 将全部音频的最大长度限制到这个数；
+        :param pad_audio: 是否对一个 batch 中的音频全部 pad 到它们中的最长的长度或者 max_sample_size；如果为 False，那么就将所有音频裁剪
+         到这个 batch 中的最短的长度；
+        :param random_crop: 如果不 pad 到最长，那么是否在音频中随机裁剪一段，还是说全部默认从 0 开始裁剪到对应长度；
+        :param pad_token_id: 用于 pad 标签序列，这里需要和 label_processors 保持一致；
+        :return:
+        """
+        sample_list = [s for s in batch if s["audio"] is not None]
+        if len(sample_list) == 0:
+            return {}
+
+        audio_list = [s["audio"] for s in sample_list]
+        audio_size_list = [len(s) for s in audio_list]
+        label_list = [s['label'] for s in sample_list]
+
+        if self.pad_audio:
+            # collate audio;
+            audio_size = min(max(audio_size_list), self.max_sample_size)
+            collated_audios = audio_list[0].new_zeros(len(audio_list), audio_size)
+            # wav2vec2 中预训练 base 和 large 都没有使用 padding mask（指加载数据时，但实际上 fairseq 使用了 require len multiple of），而在微调时使用；
+            #  fairseq 实现的 hubert 本身则全部默认使用 padding mask；
+            # 这里我们按照 transformers 的设定，1 表示需要 attend，0 表示不需要，因此 0 表示该位置是 pad；需要在实现模型的时候考虑到这一点；
+            padding_mask = torch.BoolTensor(collated_audios.shape).fill_(True)
+            audio_start_list = [0 for _ in range(len(collated_audios))]
+            for i, audio in enumerate(audio_list):
+                diff = len(audio) - audio_size
+                if diff == 0:
+                    collated_audios[i] = audio
+                elif diff < 0:
+                    collated_audios[i] = torch.cat([audio, audio.new_full((-diff,), 0.0)])
+                    padding_mask[i, diff:] = False
+                else:
+                    raise RuntimeError
+
+            # collate label;
+            frame_start_list = [int(round(s * self.s2f)) for s in audio_start_list]
+            frame_size = int(round(audio_size * self.s2f))
+            label_list = [torch.LongTensor(t[s: s + frame_size]) for t, s in zip(label_list, frame_start_list)]
+            lengths = torch.LongTensor([len(t) for t in label_list])
+            ntokens = lengths.sum().items()
+            collated_labels = label_list.new((len(label_list), frame_size)).fill_(self.pad_token_id)
+            for i, label in enumerate(label_list):
+                collated_labels[i, :len(label)] = label
+        else:
+            # collate audio;
+            audio_size = min(min(audio_size_list), self.max_sample_size)
+            collated_audios = audio_list[0].new_zeros(len(audio_list), audio_size)
+            padding_mask = torch.BoolTensor(collated_audios.shape).fill_(True)
+            audio_start_list = [0 for _ in range(len(collated_audios))]
+            for i, audio in enumerate(audio_list):
+                diff = len(audio) - audio_size
+                if diff == 0:
+                    collated_audios[i] = audio
+                elif diff > 0:
+                    start, end = 0, audio_size
+                    if self.random_crop:
+                        start = np.random.randint(0, diff + 1)
+                        end = start + audio_size
+                    collated_audios[i] = audio[start: end]
+                    audio_start_list[i] = start
+                else:
+                    raise RuntimeError
+            # collate label;
+            frame_start_list = [int(round(s * self.s2f)) for s in audio_start_list]
+            frame_size = int(round(audio_size * self.s2f))
+            rem_size_list = [len(t) - s for t, s in zip(label_list, frame_start_list)]
+            frame_size = min(frame_size, *rem_size_list)
+            label_list = [torch.LongTensor(t[s: s + frame_size]) for t, s in zip(label_list, frame_start_list)]
+            lengths = torch.LongTensor([len(t) for t in label_list])
+            ntokens = lengths.sum().items()
+            collated_labels = torch.cat(label_list)
+
+        collated_batch = {
+            "idx": torch.LongTensor([s['idx'] for s in batch]),
+            "net_input": {
+                "audio": collated_audios,
+                "padding_mask": padding_mask,
+            },
+            "label_lengths": lengths,
+            "label_ntokens": ntokens,
+            "labels": collated_labels
+        }
+
+        return collated_batch
 
 
 
